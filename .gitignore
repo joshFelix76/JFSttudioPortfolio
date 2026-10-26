@@ -1,0 +1,21 @@
+# 建置產物（由 GitHub Actions 產生，不需提交）
+site/
+.site-build-*/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# 本機環境與憑證（絕對不要提交 Token）
+.env
+.env.*
+
+# 編輯器與系統檔案
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
