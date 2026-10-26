@@ -1,0 +1,10 @@
+{
+  "projects": [
+    {
+      "owner": "your-github-username",
+      "repo": "your-private-repo",
+      "branch": "main",
+      "title": "公開顯示的專案標題"
+    }
+  ]
+}

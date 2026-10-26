@@ -72,6 +72,30 @@ def add_repo(routes: dict, owner: str, repo: str, *, intro=None, cover=None, pri
     return routes
 
 
+@pytest.fixture(autouse=True)
+def no_retry_wait(monkeypatch):
+    sleeps: list[float] = []
+    monkeypatch.setattr(bp.time, "sleep", sleeps.append)
+    return sleeps
+
+
+class FlakySession(FakeSession):
+    """前 N 次請求回傳指定的暫時性錯誤，之後依路由正常回應。"""
+
+    def __init__(self, routes, failures):
+        super().__init__(routes)
+        self.failures = list(failures)
+
+    def get(self, url: str, **kwargs):
+        if self.failures:
+            self.calls.append((url, kwargs))
+            failure = self.failures.pop(0)
+            if isinstance(failure, Exception):
+                raise failure
+            return failure
+        return super().get(url, **kwargs)
+
+
 @pytest.fixture
 def workspace(tmp_path: Path):
     """建立獨立的專案目錄（使用真實的範本、CSS 與預設封面）。"""
@@ -130,14 +154,55 @@ def test_empty_project_list_builds_without_token(workspace, tmp_path, monkeypatc
     assert Image.open(site / "assets" / "cover.png").format == "PNG"
 
 
-def test_main_with_repository_projects_json_succeeds(tmp_path, monkeypatch):
-    """實際的 projects.json（初始為空）可直接建置成功。"""
+def test_main_reads_empty_list_from_env(tmp_path, monkeypatch):
+    """PROJECTS_JSON 為空清單時不需要 Token 即可建置。"""
     monkeypatch.delenv(bp.TOKEN_ENV, raising=False)
-    data = json.loads((ROOT / "projects.json").read_text(encoding="utf-8"))
-    if data["projects"]:
-        pytest.skip("projects.json 已有專案，需要 Token 才能建置")
+    monkeypatch.setenv(bp.PROJECTS_ENV, '{"projects": []}')
     assert bp.main(["--output", str(tmp_path / "site")]) == 0
-    assert (tmp_path / "site" / "index.html").is_file()
+    assert "作品整理中" in (tmp_path / "site" / "index.html").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("value", [None, "", "   "])
+def test_missing_projects_json_fails_with_setup_hint(tmp_path, monkeypatch, capsys, value):
+    """未設定 Secret 時必須失敗，避免誤部署成空網站。"""
+    monkeypatch.delenv(bp.TOKEN_ENV, raising=False)
+    if value is None:
+        monkeypatch.delenv(bp.PROJECTS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(bp.PROJECTS_ENV, value)
+    assert bp.main(["--output", str(tmp_path / "site")]) == 1
+    err = capsys.readouterr().err
+    assert "PROJECTS_JSON" in err and "Settings → Secrets and variables → Actions" in err
+    assert not (tmp_path / "site").exists()
+
+
+def test_build_uses_projects_json_env(tmp_path, monkeypatch, capsys):
+    routes = add_repo({}, "alice", "secret-tool", intro="介紹", cover=make_png())
+    monkeypatch.setenv(bp.PROJECTS_ENV, json.dumps({"projects": [PROJECT_A]}, ensure_ascii=False))
+    cards = bp.build(
+        projects_json=bp.os.environ[bp.PROJECTS_ENV],
+        output_dir=tmp_path / "site",
+        token=FAKE_TOKEN,
+        session=FakeSession(routes),
+        now=NOW,
+    )
+    assert [c.title for c in cards] == ["Python 自動化工具"]
+    out = capsys.readouterr().out
+    assert "alice" not in out and "secret-tool" not in out
+
+
+def test_projects_file_overrides_env(workspace, tmp_path, monkeypatch):
+    monkeypatch.setenv(bp.PROJECTS_ENV, "{broken")
+    cards, _ = run_build(workspace([]), tmp_path, session=FakeSession(), token=None)
+    assert cards == []
+
+
+def test_invalid_projects_json_env_does_not_echo_content(tmp_path):
+    secret_value = '{"projects": [{"owner": "alice", "repo": "secret-tool" "title": "x"}]}'
+    with pytest.raises(bp.PortfolioError) as exc:
+        bp.build(projects_json=secret_value, output_dir=tmp_path / "site", session=FakeSession())
+    assert "PROJECTS_JSON" in str(exc.value)
+    assert "secret-tool" not in str(exc.value) and "alice" not in str(exc.value)
 
 
 def test_projects_without_token_fail_with_setup_hint(workspace, tmp_path):
@@ -182,17 +247,52 @@ def test_cover_non_404_error_fails_build(workspace, tmp_path, status):
     assert not (tmp_path / "site").exists()
 
 
+@pytest.mark.parametrize("failure", [make_response(502), make_response(503), requests.ConnectionError("x")])
+def test_transient_errors_are_retried(workspace, tmp_path, no_retry_wait, failure):
+    routes = add_repo({}, "alice", "secret-tool", intro="介紹", cover=make_png())
+    session = FlakySession(routes, [failure, failure])
+    cards, _ = run_build(workspace([PROJECT_A]), tmp_path, session=session)
+    assert len(cards) == 1
+    assert no_retry_wait == list(bp.RETRY_DELAYS)
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 429])
+def test_non_transient_errors_are_not_retried(workspace, tmp_path, no_retry_wait, status):
+    session = FakeSession({f"{API}/alice/secret-tool": make_response(status)})
+    with pytest.raises(bp.PortfolioError):
+        run_build(workspace([PROJECT_A]), tmp_path, session=session)
+    assert len(session.calls) == 1 and no_retry_wait == []
+
+
+def test_persistent_5xx_fails_after_retries(workspace, tmp_path, no_retry_wait):
+    session = FakeSession({f"{API}/alice/secret-tool": make_response(502)})
+    with pytest.raises(bp.PortfolioError, match="HTTP 502"):
+        run_build(workspace([PROJECT_A]), tmp_path, session=session)
+    assert len(session.calls) == 1 + len(bp.RETRY_DELAYS)
+
+
 def test_cover_network_error_fails_build(workspace, tmp_path):
     routes = add_repo({}, "alice", "secret-tool", intro="介紹", cover=requests.ConnectionError("boom"))
     with pytest.raises(bp.PortfolioError, match="網路連線失敗"):
         run_build(workspace([PROJECT_A]), tmp_path, session=FakeSession(routes))
 
 
-@pytest.mark.parametrize("payload", [b"not a png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 50, b"GIF89a....."])
-def test_invalid_cover_png_fails_build(workspace, tmp_path, payload):
+def make_ico() -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", (32, 32), (9, 9, 9)).save(buf, format="ICO")
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("payload", [b"not a png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 50, b"GIF89a.....", make_ico()])
+def test_invalid_cover_png_is_not_published(workspace, tmp_path, capsys, payload):
+    """內容不是 PNG 的 cover.png 不會被發布，改用預設封面並輸出警告。"""
     routes = add_repo({}, "alice", "secret-tool", intro="介紹", cover=payload)
-    with pytest.raises(bp.PortfolioError, match="不是有效的 PNG"):
-        run_build(workspace([PROJECT_A]), tmp_path, session=FakeSession(routes))
+    cards, site = run_build(workspace([PROJECT_A]), tmp_path, session=FakeSession(routes))
+    assert cards[0].cover_path == "assets/cover.png"
+    assert not any((site / "assets" / "covers").iterdir())
+    out = capsys.readouterr().out
+    assert "::warning::" in out and "不是有效的 PNG" in out
+    assert "secret-tool" not in out
 
 
 def test_cover_metadata_is_stripped(workspace, tmp_path):
@@ -550,6 +650,73 @@ def test_error_messages_do_not_contain_token(workspace, tmp_path):
     with pytest.raises(bp.PortfolioError) as exc:
         run_build(workspace([PROJECT_A]), tmp_path, session=FakeSession(routes))
     assert FAKE_TOKEN not in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "routes_factory",
+    [
+        lambda: {},  # Repository 404
+        lambda: {f"{API}/alice/secret-tool": make_response(403)},
+        lambda: add_repo({}, "alice", "secret-tool", private=False),
+        lambda: add_repo({}, "alice", "secret-tool"),  # 缺 intro.md
+        lambda: add_repo({}, "alice", "secret-tool", intro="", cover=make_png()),
+        lambda: add_repo({}, "alice", "secret-tool", intro="介紹", cover=make_response(500)),
+        lambda: add_repo({}, "alice", "secret-tool", intro="介紹", cover=requests.ConnectionError("x")),
+    ],
+)
+def test_error_messages_hide_private_repo_identity(workspace, tmp_path, capsys, routes_factory):
+    """公開 Repository 的 Actions 日誌是公開的：錯誤訊息只能出現序號與公開標題。"""
+    project = dict(PROJECT_A, branch="feature/secret-branch")
+    routes = {
+        url.replace("ref=main", "ref=feature%2Fsecret-branch"): resp
+        for url, resp in routes_factory().items()
+    }
+    with pytest.raises(bp.PortfolioError) as exc:
+        run_build(workspace([project]), tmp_path, session=FakeSession(routes))
+    text = str(exc.value) + capsys.readouterr().out
+    assert "專案 #1「Python 自動化工具」" in text
+    for private in ["alice", "secret-tool", "secret-branch", "api.github.com"]:
+        assert private not in text
+
+
+@pytest.mark.parametrize("field", ["owner", "repo", "branch"])
+def test_validation_errors_do_not_echo_values(workspace, tmp_path, field):
+    project = dict(PROJECT_A, **{field: "bad value/../private-name"})
+    with pytest.raises(bp.PortfolioError) as exc:
+        run_build(workspace([project]), tmp_path, session=FakeSession())
+    assert "private-name" not in str(exc.value)
+    assert field in str(exc.value)
+
+
+def test_duplicate_error_does_not_echo_names(workspace, tmp_path):
+    with pytest.raises(bp.PortfolioError) as exc:
+        run_build(workspace([PROJECT_A, dict(PROJECT_A, title="另一個")]), tmp_path, session=FakeSession())
+    assert "secret-tool" not in str(exc.value) and "alice" not in str(exc.value)
+
+
+def test_leading_title_heading_is_removed():
+    projects = [bp.Project("alice", "secret-tool", "main", "譯音筆記")]
+    out = bp.render_intro("# 譯音筆記\n\n說明文字\n\n## 主要功能\n\n- 一", projects, "譯音筆記")
+    assert "譯音筆記" not in out
+    assert out.startswith("<p>說明文字</p>")
+    assert "<h4>主要功能</h4>" in out
+    # 標題不同時保留
+    kept = bp.render_intro("# 其他標題\n\n說明", projects, "譯音筆記")
+    assert "<h3>其他標題</h3>" in kept
+
+
+def test_output_audit_detects_owner_repo_string(tmp_path):
+    (tmp_path / "index.html").write_text("built from Alice/Secret-Tool", encoding="utf-8")
+    with pytest.raises(bp.PortfolioError, match="識別資訊"):
+        bp.audit_output(tmp_path, [bp.Project("alice", "secret-tool", "main", "t")], None)
+
+
+def test_repository_has_no_real_project_list():
+    """公開 Repository 不得包含實際的專案清單，只能保留範例。"""
+    assert not (ROOT / "projects.json").exists()
+    example = json.loads((ROOT / "projects.example.json").read_text(encoding="utf-8"))
+    projects = bp.parse_projects(example)
+    assert projects and all(p.owner == "your-github-username" for p in projects)
 
 
 def test_main_reports_error_and_exit_code(workspace, tmp_path, monkeypatch, capsys):

@@ -19,3 +19,8 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 實際的私人專案清單只存放於 Actions Secret PROJECTS_JSON，不得提交
+projects.json
+projects.local.json
+*.projects.json

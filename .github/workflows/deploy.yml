@@ -1,13 +1,20 @@
 name: Build and deploy portfolio
 
 on:
-  # 只有 main 分支的 projects.json 變更時自動部署
+  # main 分支上影響網站產出的檔案變更時自動部署
   push:
     branches: [main]
     paths:
-      - projects.json
-  # 修改 CSS、HTML、Python 等其他檔案後，請到 Actions 頁面手動執行
+      - scripts/**
+      - templates/**
+      - assets/**
+      - requirements.txt
+      - .github/workflows/deploy.yml
+  # 更新 PROJECTS_JSON Secret 不會觸發 workflow，請到 Actions 頁面手動執行
   workflow_dispatch:
+  # 每週一 02:00（UTC）重新建置，同步私人 Repository 中更新過的 intro.md / cover.png
+  schedule:
+    - cron: "0 2 * * 1"
 
 # 預設不給任何權限，各 Job 再明確宣告所需的最小權限
 permissions: {}
@@ -44,7 +51,8 @@ jobs:
 
       - name: Build portfolio
         env:
-          # 只在此步驟提供私人 Repository 的唯讀 Token；不會寫入任何檔案
+          # 只在此步驟提供私人專案清單與唯讀 Token；程式不會將其寫入檔案或日誌
+          PROJECTS_JSON: ${{ secrets.PROJECTS_JSON }}
           PRIVATE_REPOS_TOKEN: ${{ secrets.PRIVATE_REPOS_TOKEN }}
         run: python scripts/build_portfolio.py
 

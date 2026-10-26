@@ -1,15 +1,17 @@
 """產生 JF Studio 作品集靜態網站。
 
 流程：
-1. 讀取並驗證 ``projects.json``。
+1. 從環境變數 ``PROJECTS_JSON``（GitHub Actions Secret）讀取並驗證專案清單；
+   本機測試時可改用 ``--projects`` 指定公開 Repository 以外的檔案。
 2. 透過 GitHub REST API，僅讀取每個已登記私人 Repository 根目錄的
    ``cover.png``（選擇性）與 ``intro.md``（必要）。
 3. 將 Markdown 轉為 HTML 並以白名單清理，產生 ``site/`` 靜態網站。
 
 安全原則：
 - 只允許程式內固定的檔案路徑（ALLOWED_REMOTE_FILES），不接受任何外部指定路徑或 URL。
-- Token 只從環境變數 PRIVATE_REPOS_TOKEN 讀取，不寫入任何檔案或日誌。
-- 輸出的網站不包含私人 Repository 的連結、Token 或其他檔案。
+- Token 與專案清單只從環境變數讀取，不寫入任何檔案或日誌。
+- 日誌與錯誤訊息只以「專案 #序號」與公開標題識別專案，不輸出 owner / repo / branch。
+- 輸出的網站不包含私人 Repository 的名稱、連結、Token 或其他檔案。
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,7 +39,6 @@ import requests
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_PROJECTS_FILE = ROOT / "projects.json"
 DEFAULT_TEMPLATE_FILE = ROOT / "templates" / "index.html"
 DEFAULT_ASSETS_DIR = ROOT / "assets"
 DEFAULT_OUTPUT_DIR = ROOT / "site"
@@ -44,7 +46,10 @@ DEFAULT_OUTPUT_DIR = ROOT / "site"
 API_BASE = "https://api.github.com"
 API_VERSION = "2022-11-28"
 REQUEST_TIMEOUT = 20
+RETRY_DELAYS = (2, 5)  # 暫時性錯誤的重試等待秒數
 TOKEN_ENV = "PRIVATE_REPOS_TOKEN"
+PROJECTS_ENV = "PROJECTS_JSON"
+SECRETS_HINT = "GitHub Repository 的 Settings → Secrets and variables → Actions"
 DEFAULT_BRANCH = "main"
 
 COVER_FILE = "cover.png"
@@ -88,33 +93,43 @@ class Project:
     repo: str
     branch: str
     title: str
+    index: int = 0
 
     @property
     def full_name(self) -> str:
         return f"{self.owner}/{self.repo}"
 
+    @property
+    def label(self) -> str:
+        """可公開顯示於日誌的識別：只含序號與公開標題，不含 owner / repo。"""
+        return f"專案 #{self.index}「{self.title}」"
+
 
 # ---------------------------------------------------------------------------
-# projects.json 驗證
+# 專案清單驗證（錯誤訊息不回顯任何欄位值，避免私人 Repository 名稱進入公開日誌）
 # ---------------------------------------------------------------------------
 
 def load_projects(path: Path) -> list[Project]:
     try:
         raw = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
-        raise PortfolioError(f"找不到專案清單：{path.name}") from None
+        raise PortfolioError(f"找不到專案清單檔案：{path.name}") from None
+    return parse_projects_text(raw, path.name)
+
+
+def parse_projects_text(raw: str, source: str) -> list[Project]:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise PortfolioError(
-            f"{path.name} 不是有效的 JSON（第 {exc.lineno} 行第 {exc.colno} 欄）：{exc.msg}"
+            f"{source} 不是有效的 JSON（第 {exc.lineno} 行第 {exc.colno} 欄）：{exc.msg}"
         ) from None
     return parse_projects(data)
 
 
 def parse_projects(data: Any) -> list[Project]:
     if not isinstance(data, dict) or set(data) != {"projects"}:
-        raise PortfolioError('projects.json 最外層必須是只包含 "projects" 欄位的物件，例如 {"projects": []}')
+        raise PortfolioError('專案清單最外層必須是只包含 "projects" 欄位的物件，例如 {"projects": []}')
     items = data["projects"]
     if not isinstance(items, list):
         raise PortfolioError('"projects" 必須是陣列')
@@ -145,11 +160,11 @@ def parse_projects(data: Any) -> list[Project]:
         title = item["title"].strip()
 
         if not OWNER_RE.match(owner):
-            raise PortfolioError(f"{where}.owner 不是有效的 GitHub 帳號或組織名稱：{owner!r}")
+            raise PortfolioError(f"{where}.owner 不是有效的 GitHub 帳號或組織名稱")
         if not REPO_RE.match(repo) or repo in {".", ".."} or repo.lower().endswith(".git"):
-            raise PortfolioError(f"{where}.repo 不是有效的 Repository 名稱：{repo!r}")
+            raise PortfolioError(f"{where}.repo 不是有效的 Repository 名稱")
         if not is_valid_branch(branch):
-            raise PortfolioError(f"{where}.branch 不是有效的分支名稱：{branch!r}")
+            raise PortfolioError(f"{where}.branch 不是有效的分支名稱")
         if not title:
             raise PortfolioError(f"{where}.title 不可為空白")
         if len(title) > MAX_TITLE_LENGTH:
@@ -157,9 +172,9 @@ def parse_projects(data: Any) -> list[Project]:
 
         key = f"{owner}/{repo}".lower()
         if key in seen:
-            raise PortfolioError(f"{where} 與 projects[{seen[key]}] 重複登記同一個 Repository：{owner}/{repo}")
+            raise PortfolioError(f"{where} 與 projects[{seen[key]}] 重複登記同一個 Repository")
         seen[key] = index
-        projects.append(Project(owner=owner, repo=repo, branch=branch, title=title))
+        projects.append(Project(owner=owner, repo=repo, branch=branch, title=title, index=index))
     return projects
 
 
@@ -195,17 +210,28 @@ class GitHubClient:
             "X-GitHub-Api-Version": API_VERSION,
             "User-Agent": "JFSttudioPortfolio-builder",
         }
-        try:
-            return self._session.get(url, headers=headers, timeout=REQUEST_TIMEOUT, allow_redirects=False)
-        except requests.RequestException as exc:
-            raise PortfolioError(f"{what}：網路連線失敗（{type(exc).__name__}）") from None
+        # 僅對暫時性錯誤（5xx、網路中斷）重試；401/403/404/429 等立即回傳由呼叫端判斷。
+        for attempt, delay in enumerate((*RETRY_DELAYS, None), start=1):
+            try:
+                resp = self._session.get(url, headers=headers, timeout=REQUEST_TIMEOUT, allow_redirects=False)
+            except requests.RequestException as exc:
+                if delay is None:
+                    raise PortfolioError(f"{what}：網路連線失敗（{type(exc).__name__}）") from None
+                reason = type(exc).__name__
+            else:
+                if resp.status_code < 500 or delay is None:
+                    return resp
+                reason = f"HTTP {resp.status_code}"
+            print(f"  {what}：暫時性錯誤（{reason}），{delay} 秒後重試（第 {attempt} 次）")
+            time.sleep(delay)
+        raise AssertionError("unreachable")
 
     @staticmethod
     def _repo_path(project: Project) -> str:
         return f"{API_BASE}/repos/{quote(project.owner, safe='')}/{quote(project.repo, safe='')}"
 
     def ensure_private(self, project: Project) -> None:
-        what = f"[{project.full_name}] 讀取 Repository 資訊"
+        what = f"{project.label} 讀取 Repository 資訊"
         resp = self._get(self._repo_path(project), "application/vnd.github+json", what)
         if resp.status_code == 404:
             raise PortfolioError(
@@ -219,14 +245,14 @@ class GitHubClient:
             raise PortfolioError(f"{what} 失敗：API 回傳的內容不是有效的 JSON") from None
         if info.get("private") is not True:
             raise PortfolioError(
-                f"[{project.full_name}] 不是 Private Repository。本作品集只展示已登記的私人 Repository，請確認 projects.json 設定"
+                f"{project.label} 不是 Private Repository。本作品集只展示已登記的私人 Repository，請確認 {PROJECTS_ENV} 設定"
             )
 
     def fetch_file(self, project: Project, filename: str, max_bytes: int) -> bytes | None:
         """讀取根目錄檔案。檔案不存在（HTTP 404）時回傳 None，其他錯誤一律拋出例外。"""
         if filename not in ALLOWED_REMOTE_FILES:
             raise PortfolioError(f"拒絕讀取未核准的檔案：{filename!r}")
-        what = f"[{project.full_name}] 讀取 {filename}"
+        what = f"{project.label} 讀取 {filename}"
         url = f"{self._repo_path(project)}/contents/{filename}?ref={quote(project.branch, safe='')}"
         resp = self._get(url, "application/vnd.github.raw+json", what)
         if resp.status_code == 404:
@@ -273,8 +299,11 @@ def redact_private_references(text: str, projects: list[Project]) -> str:
     return TOKEN_PATTERN.sub(REDACTED_TOKEN, text)
 
 
-def render_intro(markdown_text: str, projects: list[Project]) -> str:
-    """Markdown → HTML → 白名單清理。結果不含連結、圖片、腳本或任何屬性。"""
+def render_intro(markdown_text: str, projects: list[Project], title: str | None = None) -> str:
+    """Markdown → HTML → 白名單清理。結果不含連結、圖片、腳本或任何屬性。
+
+    若介紹開頭的一級標題與卡片標題相同，會移除該標題以免重複顯示。
+    """
     text = redact_private_references(markdown_text, projects)
     raw_html = markdown.markdown(text, extensions=["fenced_code", "sane_lists"], output_format="html")
     cleaned = nh3.clean(
@@ -285,7 +314,11 @@ def render_intro(markdown_text: str, projects: list[Project]) -> str:
         url_schemes=set(),
         link_rel=None,
         strip_comments=True,
-    )
+    ).strip()
+    if title:
+        leading = re.match(r"<h1>(.*?)</h1>\s*", cleaned, re.DOTALL)
+        if leading and html.unescape(leading.group(1)).strip() == title.strip():
+            cleaned = cleaned[leading.end():]
     # 卡片標題為 <h2>，將介紹中的標題往下調整，維持正確的標題階層。
     cleaned = re.sub(
         r"<(/?)h([1-6])>",
@@ -334,25 +367,31 @@ def collect_cards(projects: list[Project], client: GitHubClient, covers_dir: Pat
 
         intro_bytes = client.fetch_file(project, INTRO_FILE, MAX_INTRO_BYTES)
         if intro_bytes is None:
-            raise PortfolioError(f"[{project.full_name}] 根目錄缺少必要的 {INTRO_FILE}（分支：{project.branch}）")
+            raise PortfolioError(f"{project.label} 的 Repository 根目錄缺少必要的 {INTRO_FILE}（指定分支上找不到）")
         try:
             intro_text = intro_bytes.decode("utf-8-sig")
         except UnicodeDecodeError:
-            raise PortfolioError(f"[{project.full_name}] {INTRO_FILE} 必須是 UTF-8 編碼") from None
-        intro_html = render_intro(intro_text, projects)
+            raise PortfolioError(f"{project.label} 的 {INTRO_FILE} 必須是 UTF-8 編碼") from None
+        intro_html = render_intro(intro_text, projects, project.title)
         if not intro_html:
-            raise PortfolioError(f"[{project.full_name}] {INTRO_FILE} 內容為空，無法產生卡片")
+            raise PortfolioError(f"{project.label} 的 {INTRO_FILE} 內容為空，無法產生卡片")
 
+        cover_path = "assets/cover.png"
         cover_bytes = client.fetch_file(project, COVER_FILE, MAX_COVER_BYTES)
         if cover_bytes is None:
             print(f"  {COVER_FILE} 不存在（HTTP 404），使用預設封面")
-            cover_path = "assets/cover.png"
         else:
-            png = normalize_png(cover_bytes, f"[{project.full_name}] {COVER_FILE}")
-            # 以序號命名，避免在網站檔名中出現 Repository 名稱。
-            filename = f"project-{index:02d}.png"
-            (covers_dir / filename).write_bytes(png)
-            cover_path = f"assets/covers/{filename}"
+            try:
+                png = normalize_png(cover_bytes, f"{project.label} 的 {COVER_FILE}")
+            except PortfolioError as exc:
+                # 檔案內容不是 PNG（例如副檔名改成 .png 的 ICO）：不發布該檔案，改用預設封面。
+                # API 與權限錯誤已在 fetch_file 中讓建置失敗，不會走到這裡。
+                print(f"::warning::{exc}，已改用預設封面")
+            else:
+                # 以序號命名，避免在網站檔名中出現 Repository 名稱。
+                filename = f"project-{index:02d}.png"
+                (covers_dir / filename).write_bytes(png)
+                cover_path = f"assets/covers/{filename}"
 
         cards.append(Card(title=project.title, cover_path=cover_path, intro_html=intro_html))
     return cards
@@ -404,10 +443,26 @@ def audit_output(site_dir: Path, projects: list[Project], token: str | None) -> 
             text = data.decode("utf-8", errors="replace")
             if redact_private_references(text, projects) != text:
                 raise PortfolioError(f"安全檢查失敗：輸出檔案 {path.name} 含有私人 Repository 網址或疑似 Token")
+            lowered = text.lower()
+            if any(p.full_name.lower() in lowered for p in projects):
+                raise PortfolioError(f"安全檢查失敗：輸出檔案 {path.name} 含有私人 Repository 識別資訊")
+
+
+def resolve_projects(projects_json: str | None, projects_file: Path | None) -> list[Project]:
+    """專案清單來源：--projects 指定的檔案優先，否則讀取 PROJECTS_JSON 環境變數。"""
+    if projects_file is not None:
+        return load_projects(projects_file)
+    if projects_json is None or not projects_json.strip():
+        raise PortfolioError(
+            f"未提供專案清單：請到 {SECRETS_HINT} 設定名為 {PROJECTS_ENV} 的 Secret"
+            f'（沒有要展示的專案時請設定為 {{"projects": []}}）；本機測試可改用 --projects 指定檔案'
+        )
+    return parse_projects_text(projects_json, PROJECTS_ENV)
 
 
 def build(
-    projects_file: Path = DEFAULT_PROJECTS_FILE,
+    projects_json: str | None = None,
+    projects_file: Path | None = None,
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     template_file: Path = DEFAULT_TEMPLATE_FILE,
     assets_dir: Path = DEFAULT_ASSETS_DIR,
@@ -415,7 +470,7 @@ def build(
     session: HttpSession | None = None,
     now: datetime | None = None,
 ) -> list[Card]:
-    projects = load_projects(projects_file)
+    projects = resolve_projects(projects_json, projects_file)
     template_text = template_file.read_text(encoding="utf-8")
     now = now or datetime.now(timezone.utc)
 
@@ -424,9 +479,8 @@ def build(
         token = (token or "").strip()
         if not token:
             raise PortfolioError(
-                f"projects.json 已登記 {len(projects)} 個專案，但未設定 {TOKEN_ENV}。"
-                f"請到 GitHub Repository 的 Settings → Secrets and variables → Actions 新增名為 {TOKEN_ENV} 的 Secret；"
-                f"本機執行時請以環境變數提供"
+                f"專案清單已登記 {len(projects)} 個專案，但未設定 {TOKEN_ENV}。"
+                f"請到 {SECRETS_HINT} 新增名為 {TOKEN_ENV} 的 Secret；本機執行時請以環境變數提供"
             )
         client = GitHubClient(token, session)
 
@@ -462,12 +516,20 @@ def main(argv: list[str] | None = None) -> int:
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="產生作品集靜態網站")
-    parser.add_argument("--projects", type=Path, default=DEFAULT_PROJECTS_FILE, help="專案清單 JSON 路徑")
+    parser.add_argument(
+        "--projects", type=Path, default=None,
+        help=f"本機測試用的專案清單 JSON 路徑（未指定時讀取環境變數 {PROJECTS_ENV}）",
+    )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_DIR, help="輸出目錄（預設 site/）")
     args = parser.parse_args(argv)
 
     try:
-        cards = build(projects_file=args.projects, output_dir=args.output, token=os.environ.get(TOKEN_ENV))
+        cards = build(
+            projects_json=os.environ.get(PROJECTS_ENV),
+            projects_file=args.projects,
+            output_dir=args.output,
+            token=os.environ.get(TOKEN_ENV),
+        )
     except PortfolioError as exc:
         print(f"建置失敗：{exc}", file=sys.stderr)
         return 1

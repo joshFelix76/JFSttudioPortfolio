@@ -1,8 +1,10 @@
 # JF Studio 作品集（JFSttudioPortfolio）
 
 以 GitHub Pages 發布的卡片式個人作品集網站。網站內容由 Python 在 GitHub Actions 中自動產生：
-讀取 `projects.json` 登記的**私人** Repository，僅擷取其根目錄的 `cover.png` 與 `intro.md`，
+讀取 Actions Secret `PROJECTS_JSON` 登記的**私人** Repository，僅擷取其根目錄的 `cover.png` 與 `intro.md`，
 轉換成靜態 HTML 後部署。網站不需要後端、資料庫或前端 Token，也不會提供任何通往私人 Repository 的連結。
+
+實際的專案清單（owner、repo、branch）**只存放在 Secret 中**，不會出現在本公開 Repository 的任何檔案裡。
 
 ---
 
@@ -14,7 +16,7 @@
 4. [初次設定 GitHub Pages](#初次設定-github-pages)
 5. [建立 Fine-grained PAT](#建立-fine-grained-pat)
 6. [設定 PRIVATE_REPOS_TOKEN Secret](#設定-private_repos_token-secret)
-7. [新增、修改、移除展示專案](#新增修改移除展示專案)
+7. [設定 PROJECTS_JSON：新增、修改、移除展示專案](#設定-projects_json新增修改移除展示專案)
 8. [私人 Repository 需要放置的檔案](#私人-repository-需要放置的檔案)
 9. [封面預設圖規則](#封面預設圖規則)
 10. [自動觸發與手動部署](#自動觸發與手動部署)
@@ -26,11 +28,11 @@
 ## 架構概覽
 
 ```
-projects.json ──(push 到 main)──▶ GitHub Actions
+push / 手動執行 / 每週排程 ──▶ GitHub Actions
                                    │
-                                   ├─ 安裝依賴、執行 pytest
-                                   ├─ build_portfolio.py
-                                   │    ├─ 驗證 projects.json
+                                   ├─ 安裝依賴、執行 pytest（不提供任何 Secret）
+                                   ├─ build_portfolio.py（僅此步驟提供 PROJECTS_JSON、PRIVATE_REPOS_TOKEN）
+                                   │    ├─ 驗證 PROJECTS_JSON
                                    │    ├─ GitHub REST API（Fine-grained PAT，Contents: Read-only）
                                    │    │    ├─ GET /repos/{owner}/{repo}            → 確認為 Private
                                    │    │    ├─ GET .../contents/intro.md?ref=分支    → 必要
@@ -64,9 +66,9 @@ projects.json ──(push 到 main)──▶ GitHub Actions
 | `templates/index.html` | 網頁範本（網站標題、說明、SEO metadata 在此修改） |
 | `assets/style.css` | 網站樣式 |
 | `assets/cover.png` | 預設封面（1200 × 750 PNG） |
-| `projects.json` | **唯一的**展示專案登記清單 |
+| `projects.example.json` | 專案清單格式範例（僅含佔位資料；實際清單存放於 Secret `PROJECTS_JSON`） |
 | `requirements.txt` | Python 依賴（固定版本） |
-| `.gitignore` | 排除 `site/`、快取與 `.env` 等檔案 |
+| `.gitignore` | 排除 `site/`、快取、`.env` 與 `projects.json`（避免誤提交實際清單） |
 | `site/` | 建置產物（自動產生，不提交進 Git） |
 
 `templates/index.html` 中的 `$content`、`$project_count`、`$year`、`$updated` 是由程式填入的佔位符，
@@ -74,19 +76,21 @@ projects.json ──(push 到 main)──▶ GitHub Actions
 
 ## 安全性與公開範圍（請務必閱讀）
 
-- **`projects.json` 不是保密設定檔。** 本 Repository 為 Public，`projects.json` 內的 `owner` 與 `repo`
-  名稱任何人都看得到；GitHub Actions 的執行日誌在公開 Repository 中也是公開的。
-  如果私人 Repository 的「名稱」本身就是機密，請不要登記到這裡。
+- **私人 Repository 的 owner / repo / branch 只存放於 Secret `PROJECTS_JSON`。** 本 Repository 為 Public，
+  請勿在任何檔案、Issue 或 commit 訊息中寫入實際清單；`projects.json` 已列入 `.gitignore`。
+- GitHub Actions 的執行日誌在公開 Repository 中**任何人都看得到**。建置程式的日誌與錯誤訊息只以
+  「專案 #序號「公開標題」」識別專案，不輸出 owner、repo、branch 或 API 網址；驗證錯誤也不回顯欄位值。
 - **只有 `cover.png` 與 `intro.md` 會被發布。** 這兩個檔案的內容一旦部署，即成為任何人都能看到的公開資訊，
   請只放允許公開的內容。私人 Repository 的其他檔案（原始碼、設定、其他圖片）一律不會被讀取。
-- 程式只允許讀取固定的兩個根目錄檔案；`projects.json` 不接受 `path`、`url` 等任何其他欄位。
+- 程式只允許讀取固定的兩個根目錄檔案；專案清單不接受 `path`、`url` 等任何其他欄位。
 - 不 clone、不下載整個 Repository、不遞迴掃描目錄。
 - 讀取前會確認 Repository 的 `private` 屬性為 `true`，公開 Repository 會被拒絕。
 - `intro.md` 會轉為 HTML 後以白名單清理：只保留段落、標題、清單、粗體、斜體、刪除線、程式碼與引用。
   `<script>`、任意 HTML、事件處理器、`style`、圖片及所有連結都會被移除（連結只保留文字）。
 - `intro.md` 中指向已登記私人 Repository 的網址，以及疑似 GitHub Token 的字串，會被替換成「[已移除私人連結]」/「[已移除]」。
 - `cover.png` 會驗證為有效 PNG，並重新編碼以移除中繼資料（例如文字區塊）。網站中的封面檔名使用序號（`project-01.png`），不含 Repository 名稱。
-- 建置最後會掃描輸出檔案，若發現 Token 或私人 Repository 網址則中止建置。
+- 建置最後會掃描輸出檔案，若發現 Token、私人 Repository 網址或 `owner/repo` 字串則中止建置。
+- `intro.md` 開頭若有與卡片標題相同的一級標題，會自動省略以免重複顯示。
 - 網頁設定 Content-Security-Policy，只允許載入同網站的 CSS 與圖片，不允許任何 JavaScript。
 - Token 只在 Actions 的建置步驟以環境變數提供，不會寫入任何檔案、HTML 或日誌；部署使用 GitHub 官方的 OIDC（`id-token: write`），不使用 PAT。
 - Workflow 不會在 Pull Request 觸發，因此 Secret 不會暴露給 Pull Request。
@@ -104,7 +108,7 @@ projects.json ──(push 到 main)──▶ GitHub Actions
 
 ## 建立 Fine-grained PAT
 
-> 只有當 `projects.json` 中有專案時才需要 Token。空清單可直接部署。
+> 只有當 `PROJECTS_JSON` 中有專案時才需要 Token。空清單可直接部署。
 
 1. GitHub 右上角頭像 → **Settings → Developer settings → Personal access tokens → Fine-grained tokens**
    → **Generate new token**。
@@ -126,22 +130,35 @@ projects.json ──(push 到 main)──▶ GitHub Actions
 3. **Name** 輸入 `PRIVATE_REPOS_TOKEN`，**Secret** 貼上剛才的 Fine-grained PAT，按 **Add secret**。
 4. Token 到期或更換時，於同一頁面編輯此 Secret 即可，不需修改程式。
 
-## 新增、修改、移除展示專案
+## 設定 PROJECTS_JSON：新增、修改、移除展示專案
 
-所有操作只需編輯 `projects.json`，不需要修改 HTML、CSS 或 Python：
+展示清單存放在 Actions Secret `PROJECTS_JSON`，格式與 `projects.example.json` 相同：
 
 ```json
 {
   "projects": [
     {
-      "owner": "YOUR_USERNAME",
-      "repo": "my-private-project",
+      "owner": "your-github-username",
+      "repo": "your-private-repo",
       "branch": "main",
-      "title": "Python 自動化工具"
+      "title": "公開顯示的專案標題"
     }
   ]
 }
 ```
+
+GitHub 不會顯示既有 Secret 的內容，因此每次修改都要**提供完整清單**覆寫。建議在本機（本 Repository 以外的資料夾）
+保存清單檔，修改後以標準輸入更新 Secret，避免內容出現在命令列參數或歷史紀錄：
+
+```bash
+gh secret set PROJECTS_JSON --repo joshFelix76/JFSttudioPortfolio < 路徑/projects.local.json
+```
+
+也可以在 **Settings → Secrets and variables → Actions → PROJECTS_JSON → Update** 貼上完整 JSON。
+**更新 Secret 不會自動觸發部署**，請接著到 Actions 手動執行 workflow。
+
+沒有任何要展示的專案時，請設定為 `{"projects": []}`；`PROJECTS_JSON` 未設定或為空白時建置會失敗，
+以免誤將網站部署成空白。
 
 | 欄位 | 必要 | 說明 |
 | --- | --- | --- |
@@ -156,8 +173,9 @@ projects.json ──(push 到 main)──▶ GitHub Actions
 - 卡片顯示順序即為陣列順序。
 - 以下情況會被拒絕並顯示錯誤：JSON 格式錯誤、缺少必要欄位、未知欄位（例如 `path`、`url`）、
   非字串值、無效的 owner / repo / branch 名稱、同一 Repository 重複登記（不分大小寫）。
+  錯誤訊息只指出位置（例如 `projects[3].repo`），不顯示欄位內容。
 
-將修改 commit 並 push 到 `main` 後，Actions 會自動建置並部署。
+更新 Secret 後，到 Actions 手動執行 workflow 即可部署。
 
 ## 私人 Repository 需要放置的檔案
 
@@ -178,21 +196,27 @@ projects.json ──(push 到 main)──▶ GitHub Actions
 1. 私人 Repository 根目錄有 `cover.png` → 使用該封面。
 2. API 明確回傳 **HTTP 404**（檔案不存在）→ 使用本 Repository 的 `assets/cover.png`。
 3. **HTTP 401、403、429、5xx、網路錯誤**等其他狀況 → **建置失敗**，不會用預設封面掩蓋權限或 API 問題。
-4. 取得的檔案不是有效 PNG → 建置失敗。
+4. 成功取得但內容不是有效 PNG（例如副檔名改成 `.png` 的 ICO 圖示）→ **不發布該檔案**，改用預設封面，
+   並在 Actions 日誌顯示警告，提醒更換為真正的 PNG。
 
 若要更換預設封面，直接替換 `assets/cover.png`（建議 1200 × 750 PNG），
 或修改並執行 `python scripts/generate_default_cover.py`。
 
 ## 自動觸發與手動部署
 
-**自動觸發**：只有 `main` 分支上 `projects.json` 有變更的 push 才會觸發。
-私人 Repository 本身的 commit、本 Repository 其他檔案的變更、以及 Pull Request 都**不會**觸發。
+**自動觸發**：
+
+- push 到 `main` 且變更了 `scripts/`、`templates/`、`assets/`、`requirements.txt` 或 workflow 檔案。
+- 每週一 02:00（UTC）排程重建，同步私人 Repository 中更新過的 `intro.md` / `cover.png`
+  （GitHub 會在公開 Repository 連續 60 天沒有活動時停用排程，屆時到 Actions 頁面重新啟用即可）。
+
+私人 Repository 本身的 commit、`README.md` 等文件變更、以及 Pull Request 都**不會**觸發；
+Pull Request 不會取得任何 Secret。
 
 **手動部署**：以下情況請到 **Actions → Build and deploy portfolio → Run workflow** 手動執行：
 
-- 修改了 `assets/style.css`、`templates/index.html`、`scripts/` 中的 Python 程式碼或 `assets/cover.png`。
-- 私人 Repository 的 `intro.md` 或 `cover.png` 有更新，想同步到網站。
-- 更新了 `PRIVATE_REPOS_TOKEN`，想重新部署。
+- 更新了 `PROJECTS_JSON` 或 `PRIVATE_REPOS_TOKEN`（Secret 更新不會觸發 workflow）。
+- 私人 Repository 的 `intro.md` 或 `cover.png` 有更新，想立刻同步到網站。
 
 流程中任何步驟（測試、驗證、API 讀取、安全檢查）失敗時，deploy job 不會執行，網站維持上一個成功版本。
 
@@ -207,17 +231,20 @@ python -m pytest -q
 ```
 
 ```bash
-python scripts/build_portfolio.py
+python scripts/build_portfolio.py --projects projects.example.json
 ```
 
 建置結果在 `site/`，可用 `python -m http.server --directory site` 預覽。
-`projects.json` 為空時不需要 Token；若要在本機讀取私人 Repository，請在**自己的終端機**以環境變數設定
-`PRIVATE_REPOS_TOKEN`（不要寫進任何檔案或提交到 Git，`.env` 已被 `.gitignore` 排除）。
+專案清單可用 `--projects` 指定檔案，或以環境變數 `PROJECTS_JSON` 提供；清單為空時不需要 Token。
+若要在本機讀取私人 Repository，請將實際清單放在本 Repository **以外**的位置，並在**自己的終端機**以環境變數設定
+`PRIVATE_REPOS_TOKEN`（不要寫進任何檔案或提交到 Git，`.env` 與 `projects.json` 已被 `.gitignore` 排除）。
 
 ## 常見錯誤與排查
 
 | 錯誤訊息（節錄） | 原因 | 處理方式 |
 | --- | --- | --- |
+| `未提供專案清單：... PROJECTS_JSON` | Secret `PROJECTS_JSON` 未設定、名稱打錯或為空白 | 依「設定 PROJECTS_JSON」設定（沒有專案時設為 `{"projects": []}`） |
+| `PROJECTS_JSON 不是有效的 JSON（第 X 行第 Y 欄）` | Secret 內容格式錯誤 | 在本機修正清單檔後重新 `gh secret set` |
 | `已登記 N 個專案，但未設定 PRIVATE_REPOS_TOKEN` | Secret 未設定或名稱打錯 | 到 Settings → Secrets and variables → Actions 新增 `PRIVATE_REPOS_TOKEN` |
 | `HTTP 401，Token 無效或已過期` | Token 過期、被撤銷或貼錯 | 重新產生 Fine-grained PAT 並更新 Secret |
 | `HTTP 403，權限不足或觸發 API 速率限制` | Token 沒有 Contents: Read-only、組織尚未核准 PAT，或速率限制 | 檢查 Token 權限、組織的 PAT 核准設定，或稍後再執行 |
@@ -227,9 +254,8 @@ python scripts/build_portfolio.py
 | `根目錄缺少必要的 intro.md` | 指定分支的根目錄沒有 `intro.md`（注意大小寫） | 新增檔案，或確認 `branch` 設定正確 |
 | `intro.md 內容為空` | 檔案為空，或內容全部被安全清理移除 | 以 Markdown 撰寫文字內容 |
 | `intro.md 必須是 UTF-8 編碼` | 檔案為 Big5 等其他編碼 | 以 UTF-8 重新存檔 |
-| `cover.png 不是有效的 PNG 檔案` | 副檔名是 .png 但實際為 JPG 等其他格式或已損毀 | 重新匯出為真正的 PNG |
+| 警告 `cover.png 不是有效的 PNG 檔案，已改用預設封面` | 副檔名是 .png 但實際為 ICO、JPG 等格式或已損毀 | 重新匯出為真正的 PNG |
 | `檔案超過大小上限` | `cover.png` > 5 MB 或 `intro.md` > 100 KB | 壓縮圖片或精簡內容 |
-| `projects.json 不是有效的 JSON` | 逗號、引號錯誤 | 依訊息中的行列位置修正 |
-| `不支援的欄位` / `不是有效的 ... 名稱` / `重複登記` | `projects.json` 格式錯誤 | 依訊息修正，僅允許 owner、repo、branch、title |
+| `不支援的欄位` / `不是有效的 ... 名稱` / `重複登記` | `PROJECTS_JSON` 內容格式錯誤 | 依訊息指出的位置修正，僅允許 owner、repo、branch、title |
 | Actions 的 Configure Pages 或 Deploy 失敗 | Pages 尚未啟用，或 Source 不是 GitHub Actions | 依「初次設定 GitHub Pages」設定 |
-| 修改 CSS 後網站沒有更新 | 自動觸發只監控 `projects.json` | 手動執行 workflow |
+| 更新 Secret 後網站沒有變化 | Secret 更新不會觸發 workflow | 手動執行 workflow |
